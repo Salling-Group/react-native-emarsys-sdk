@@ -18,3 +18,10 @@ jobs:
     name: Run iOS Tests
     uses: ./.github/workflows/run-ios-tests.yml
     secrets: inherit
+
+  reproduce-pnpm-recursion:
+    name: Reproduce pnpm Install Recursion
+    uses: ./.github/workflows/reproduce-pnpm-recursion.yml
+    with:
+      branch: MV-1170
+    secrets: inherit

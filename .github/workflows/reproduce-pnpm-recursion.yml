@@ -1,0 +1,178 @@
+name: Reproduce pnpm Install Recursion
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "SDK branch to install/test. New-Architecture-and-Expo = broken (bug present); MV-1170 = fixed."
+        type: string
+        default: New-Architecture-and-Expo
+  workflow_call:
+    inputs:
+      branch:
+        type: string
+        default: New-Architecture-and-Expo
+
+env:
+  SDK_BRANCH: ${{ inputs.branch || 'New-Architecture-and-Expo' }}
+
+jobs:
+  reproduce:
+    name: pnpm git-dep install recursion (cold store)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # pnpm 11 defaults verify-deps-before-run=install, which is what turns the
+      # nested install into a self-sustaining loop. Matches the customer's env.
+      - name: Setup pnpm 11 via corepack
+        run: |
+          corepack enable
+          corepack prepare pnpm@11 --activate
+          pnpm --version
+
+      # Consumer project depending on the SDK via a git spec, exactly like the
+      # customer. The branch ships no build/ (it is gitignored), so pnpm must
+      # run the SDK's `prepare` (expo-module prepare) to build the dep.
+      - name: Create consumer project with git dependency
+        run: |
+          mkdir consumer
+          printf '{\n  "name": "consumer",\n  "version": "1.0.0",\n  "dependencies": {\n    "react-native-emarsys-sdk": "github:emartech/react-native-emarsys-sdk#%s"\n  }\n}\n' "$SDK_BRANCH" > consumer/package.json
+          cat consumer/package.json
+          # pnpm 11 blocks git-dep build scripts unless allowlisted. Resolve the
+          # tested branch HEAD and allow it so `prepare` actually runs.
+          # Both keys are written so this works across pnpm 10/11 naming.
+          HASH=$(git ls-remote https://github.com/emartech/react-native-emarsys-sdk "refs/heads/$SDK_BRANCH" | cut -f1)
+          echo "branch $SDK_BRANCH HEAD: $HASH"
+          URL="https://codeload.github.com/emartech/react-native-emarsys-sdk/tar.gz/$HASH"
+          {
+            echo "onlyBuiltDependencies:"
+            echo "  - \"react-native-emarsys-sdk@$URL\""
+            echo "allowBuilds:"
+            echo "  \"react-native-emarsys-sdk@$URL\": true"
+          } > consumer/pnpm-workspace.yaml
+          cat consumer/pnpm-workspace.yaml
+
+      # The customer's loop, reproduced with their literal command:
+      #
+      #   `pnpm install` builds the git dep by running its `prepare`
+      #   (expo-module prepare). That shells through expo-module-scripts'
+      #   internal bin/npx wrapper, which — because pnpm sets
+      #   npm_config_user_agent — runs `pnpm exec -- npx tsc`
+      #   (node_modules/expo-module-scripts/bin/npx:9-10). With
+      #   verify-deps-before-run=install (pnpm 11 default) that nested
+      #   `pnpm exec` first runs a FULL `pnpm install`, which re-runs
+      #   postinstall + prepare -> back into the wrapper -> ...
+      #
+      #   On a COLD store (fresh CI container) each nested install has real
+      #   work, so it re-runs prepare before any single tsc build finishes and
+      #   creates build/ -> runaway. On a warm store the nested install is a
+      #   no-op, the build completes, and the loop terminates — which is why
+      #   the customer could not reproduce it locally.
+      #
+      # `timeout` caps the runner. exit 124 (timed out) or `expo-module prepare`
+      # running more than once == recursion reproduced. After the fix (prepare =
+      # plain tsc, no wrapper) the install completes normally and this passes.
+      - name: Install git dependency (cold store)
+        working-directory: consumer
+        env:
+          npm_config_store_dir: "${{ runner.temp }}/cold-store"
+          npm_config_verify_deps_before_run: "install"
+        run: |
+          set +e
+          export PNPM_HOME="$RUNNER_TEMP/pnpm-home"
+
+          timeout 300 pnpm install --no-frozen-lockfile > install.log 2>&1
+          code=$?
+
+          # A clean, successful install legitimately runs `expo-module prepare`
+          # TWICE (clean/configure phase, then build phase) inside pnpm's
+          # isolated npm subprocess, and emits ~2 `Packages: +` lines. So those
+          # counts are NOT a recursion signal. The only reliable signal that the
+          # loop never terminated is the timeout (exit 124). We also surface the
+          # counts and log size so a runaway (dozens of installs) is visible.
+          installs=$(grep -c "Packages: +" install.log)
+          prepares=$(grep -c "expo-module prepare" install.log)
+          bytes=$(wc -c < install.log)
+
+          echo "== exit code: $code (124 = timed out => recursion did not terminate) =="
+          echo "== full 'pnpm install' runs ('Packages: +'): ${installs} (a clean install is ~2) =="
+          echo "== 'expo-module prepare' ran: ${prepares} time(s) (a clean install is ~2) =="
+          echo "== log size: ${bytes} bytes =="
+          echo "== tail of log =="
+          tail -n 60 install.log
+
+          # Timeout, or a clearly runaway number of installs, means recursion.
+          if [ "$code" -eq 124 ] || [ "${installs:-0}" -gt 4 ]; then
+            echo "::error::RECURSION REPRODUCED — ${installs} nested installs, exit ${code}"
+            exit 1
+          fi
+          echo "OK — install completed without recursion (${installs} installs, exit ${code})."
+
+      # Deterministic gate (timing-independent).
+      #
+      # The step above reproduces the customer's LITERAL command, but on a
+      # standard runner pnpm builds the git dep in an isolated `npm install`
+      # subprocess (npm_config_user_agent=npm), so the wrapper takes the safe
+      # plain-`npx` branch and it does not loop. The customer's environment runs
+      # `prepare` in a pnpm context instead — that is the actual defect.
+      #
+      # This step exercises that exact defect deterministically: it runs the
+      # SDK's real `prepare` (expo-module prepare) under a pnpm user-agent, with
+      # a `pnpm` shim earlier on PATH. When expo-module-scripts' bin/npx wrapper
+      # takes the `pnpm exec` branch (the recursion vector), the shim records it.
+      #
+      #   Broken (prepare = expo-module prepare): wrapper hits `pnpm exec`
+      #     -> marker recorded -> FAIL.
+      #   Fixed  (prepare = plain tsc, no wrapper): no `pnpm exec` -> no marker
+      #     -> PASS.
+      #
+      # No dependence on cold-store timing or an infinite loop.
+      - name: Deterministic check — does prepare hit the pnpm exec vector?
+        run: |
+          set -e
+          git clone --depth 1 --branch "$SDK_BRANCH" \
+            https://github.com/emartech/react-native-emarsys-sdk sdk
+          cd sdk
+          echo "prepare script under test: $(node -p "require('./package.json').scripts.prepare")"
+          # Install dev deps so prepare's tsc build can run (uses npm to avoid
+          # priming the pnpm path we are about to measure).
+          npm install --no-audit --no-fund > /dev/null 2>&1
+
+          # A `pnpm` shim that records when it is invoked as `pnpm exec` (what
+          # the wrapper does) and then delegates to the real pnpm.
+          mkdir -p "$RUNNER_TEMP/shim"
+          REAL_PNPM="$(command -v pnpm)"
+          MARKER="$RUNNER_TEMP/shim/marker.log"
+          : > "$MARKER"
+          cat > "$RUNNER_TEMP/shim/pnpm" <<SHIM
+          #!/usr/bin/env bash
+          if [ "\$1" = "exec" ]; then echo "PNPM_EXEC" >> "$MARKER"; fi
+          exec "$REAL_PNPM" "\$@"
+          SHIM
+          chmod +x "$RUNNER_TEMP/shim/pnpm"
+
+          rm -rf build
+          # Run the real prepare under a pnpm user-agent (what pnpm sets when it
+          # runs a package's lifecycle scripts). Cap it in case it does loop.
+          set +e
+          PATH="$RUNNER_TEMP/shim:$PATH" \
+          npm_config_user_agent="pnpm/11.20.0 npm/? node/v22 linux x64" \
+            timeout 120 npm run prepare > prepare.log 2>&1
+          code=$?
+          set -e
+
+          markers=$(grep -c "PNPM_EXEC" "$MARKER" || true)
+          echo "== exit code: $code (124 = timed out => it recursed) =="
+          echo "== 'pnpm exec' invocations from the prepare wrapper: ${markers} =="
+          echo "== tail of prepare.log =="
+          tail -n 40 prepare.log
+
+          if [ "$code" -eq 124 ] || [ "${markers:-0}" -gt 0 ]; then
+            echo "::error::DEFECT PRESENT — prepare routed through 'pnpm exec' ${markers} time(s) (exit ${code}). This is the recursion vector."
+            exit 1
+          fi
+          echo "OK — prepare did not use 'pnpm exec' (fix is effective)."
