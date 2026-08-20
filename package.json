@@ -10,7 +10,6 @@
     "lint": "expo-module lint",
     "lint:all": "eslint src __tests__",
     "prepublishOnly": "expo-module prepublishOnly",
-    "prepare": "expo-module prepare",
     "postinstall": "node scripts/postinstall.js",
     "test": "jest",
     "test:watch": "jest --watch",

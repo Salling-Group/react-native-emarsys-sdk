@@ -57,5 +57,8 @@ yarn-error.log
 /coverage
 
 # Build
-build/
+# NOTE (Salling-Group fork): build/ is intentionally committed on this branch so
+# that git consumers (pnpm) do not have to run `expo-module prepare` at install
+# time, which fails with TS2742 when built in pnpm's non-portable temp dir.
+# build/
 /RNEmarsysSDK.podspec
